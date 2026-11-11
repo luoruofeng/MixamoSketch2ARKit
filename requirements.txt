@@ -1,0 +1,9 @@
+# Mixamo FBX -> ARKit / RealityKit BodyTrackedEntity USDZ
+# python -m pip install -r requirements.txt
+#
+# Python 3.9+ (developed and tested on 3.13).
+# usd-core ships the compiled pxr bindings; no USD build tools needed.
+
+numpy>=1.24
+Pillow>=10.0          # texture resize / recompress (JPEG + PNG)
+usd-core>=23.11       # pxr: Usd / UsdSkel / UsdUtils.CreateNewARKitUsdzPackage

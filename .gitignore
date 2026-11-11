@@ -218,3 +218,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- MixamoSketch2ARKit ----
+
+# 输入角色模型：体积大且受 Mixamo 账号许可约束，整个目录不入库（仅保留占位文件）
+/models/*
+!/models/.gitkeep
+
+# 流水线生成的中间产物与最终产物
+/build/
+/dist/
+*.usdc
+*.npz
+*.npz.bak
+*.usdz
+*.fbx
+*.fbx.bak
+*.obj
+*.glb
+*.gltf
+*.blend1
+
+# 补丁/临时文件
+*.orig
+*.rej
+*.log
+tempCodeRunnerFile.*
+
+# 压缩包与系统垃圾文件
+*.zip
+*.7z
+*.rar
+__MACOSX/
+.DS_Store
+Thumbs.db
