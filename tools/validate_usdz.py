@@ -18,7 +18,7 @@ import os
 import sys
 
 import numpy as np
-from pxr import Usd, UsdGeom, UsdSkel
+from pxr import Usd, UsdGeom, UsdShade, UsdSkel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -107,6 +107,24 @@ def validate(usdz, skel_json=None):
     check(bool(dp) and dp.GetTypeName() == "SkelRoot",
           "defaultPrim is a SkelRoot (Apple's layout, got %s)"
           % (dp.GetTypeName() if dp else "-"))
+
+    # usdchecker: usdSkelValidators:SkelBindingAPIValidator.InvalidSkelBindingAPIApply.
+    # Without a SkelRoot above the skinned mesh RealityKit ignores the skinning entirely
+    # and only draws the bind pose (the "T-pose that never moves" bug).
+    print("== SkelRoot layout ==")
+    roots = [p for p in stage.Traverse() if p.IsA(UsdSkel.Root)]
+    check(bool(roots), "a SkelRoot exists: %s" % ([str(r.GetPath()) for r in roots] or "none"))
+    unrooted = []
+    for p in stage.Traverse():
+        if not (p.HasAPI(UsdSkel.BindingAPI) or p.IsA(UsdSkel.Skeleton)) or p.IsA(UsdSkel.Root):
+            continue
+        anc = p.GetParent()
+        while anc and not anc.IsA(UsdSkel.Root):
+            anc = anc.GetParent()
+        if not anc:
+            unrooted.append(str(p.GetPath()))
+    check(not unrooted, "every skinned prim / Skeleton sits under a SkelRoot"
+          + ("" if not unrooted else " -> not rooted: %s" % unrooted))
 
     skels = [p for p in stage.Traverse() if p.IsA(UsdSkel.Skeleton)]
     meshes = [p for p in stage.Traverse() if p.IsA(UsdGeom.Mesh)]
@@ -275,6 +293,26 @@ def validate(usdz, skel_json=None):
         l, r = wsum[idx["left_" + a + "_joint"]], wsum[idx["right_" + a + "_joint"]]
         ratio = max(l, r) / max(min(l, r), 1e-6)
         warn(ratio < 1.8, "%s weight L %.0f / R %.0f (x%.2f)" % (a, l, r, ratio))
+
+    print("== material subsets ==")
+    for m in meshes:
+        subs = [c for c in m.GetChildren()
+                if c.IsA(UsdGeom.Subset)
+                and UsdGeom.Subset(c).GetFamilyNameAttr().Get() == "materialBind"]
+        if not subs:
+            warn(False, "%s has no materialBind GeomSubset" % m.GetName())
+            continue
+        ftype = UsdGeom.Subset.GetFamilyType(UsdGeom.Imageable(m), "materialBind")
+        check(ftype in ("partition", "nonOverlapping"),
+              "%s materialBind familyType is %r (usdchecker wants partition)"
+              % (m.GetName(), ftype))
+        no_api = [c.GetName() for c in subs if not c.HasAPI(UsdShade.MaterialBindingAPI)]
+        check(not no_api, "%d materialBind subsets carry MaterialBindingAPI" % len(subs)
+              + ("" if not no_api else " -> not applied on %s" % no_api))
+        unbound = [c.GetName() for c in subs
+                   if not UsdShade.MaterialBindingAPI(c).ComputeBoundMaterial()[0]]
+        check(not unbound, "every materialBind subset resolves to a Material"
+              + ("" if not unbound else " -> unbound: %s" % unbound))
 
     print("== no animation ==")
     anims = [p for p in stage.Traverse() if p.IsA(UsdSkel.Animation)]

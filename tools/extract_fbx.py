@@ -314,20 +314,36 @@ def extract(slug):
     CP = {k: (v @ AXIS)[3, :3] * S for k, v in B.items()}   # Mixamo bone position, metres
 
     # Some Mixamo exports store the bone offsets *only* in the Pose nodes, and a few of
-    # them are scrambled (bone names point at another bone's matrix).  There is nothing
-    # to fit in that case, so say so instead of writing a broken USDZ.
-    _h, _hd, _lf = CP.get("Hips"), CP.get("Head"), CP.get("LeftFoot")
-    if _h is not None and _hd is not None:
-        _ys = [v[1] for v in CP.values()]
-        _tall = max(_ys) - min(_ys)
-        weird = (_hd[1] < _h[1] + 0.2 * _tall)
-        if _lf is not None:
-            weird = weird or _lf[1] > _h[1] - 0.2 * _tall
-        if weird:
+    # them are scrambled (bone names point at another bone's matrix: every limb ends up
+    # on one line, the feet above the hips).  When that happens the skin clusters still
+    # carry the real bind pose in their TransformLink, so use that instead of giving up.
+    def standing_ok(cp):
+        h, hd, lf = cp.get("Hips"), cp.get("Head"), cp.get("LeftFoot")
+        if h is None or hd is None:
+            return True
+        tall = max(v[1] for v in cp.values()) - min(v[1] for v in cp.values())
+        bad = hd[1] < h[1] + 0.2 * tall
+        if lf is not None:
+            bad = bad or lf[1] > h[1] - 0.2 * tall
+        return not bad
+
+    if not standing_ok(CP):
+        B2, err2 = scene.bind_pose_clusters()
+        CP2 = {k: (v @ AXIS)[3, :3] * S for k, v in B2.items()}
+        if B2 and standing_ok(CP2):
+            print("Pose nodes are inconsistent -> bind pose from skin clusters "
+                  "(%d bones, duplicate dev %.4f)" % (len(B2), err2))
+            warnings.append("scrambled Pose nodes; bind pose taken from the skin clusters")
+            B, CP = B2, CP2
+        else:
+            _h, _hd, _lf = CP.get("Hips"), CP.get("Head"), CP.get("LeftFoot")
             raise SystemExit("FATAL: %s: the bind pose does not describe a standing "
                              "skeleton (head at y=%.2f, hips %.2f, left foot %.2f) - the "
-                             "FBX Pose nodes are inconsistent, re-export it from Mixamo"
-                             % (slug, _hd[1], _h[1], _lf[1] if _lf is not None else -1))
+                             "FBX Pose nodes are inconsistent and the skin clusters do not "
+                             "help, re-export it from Mixamo"
+                             % (slug, _hd[1] if _hd is not None else -1,
+                                _h[1] if _h is not None else -1,
+                                _lf[1] if _lf is not None else -1))
 
     def mirror_side(name):
         if name.startswith("Right"):

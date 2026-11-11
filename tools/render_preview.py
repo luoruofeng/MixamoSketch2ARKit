@@ -135,12 +135,23 @@ def render(scene, pos, shade_n, path, cam_side=False, W=760, H=980, fov=32.0):
     dr = ImageDraw.Draw(img)
     L = np.array([0.35, 0.55, 0.75])
     L /= np.linalg.norm(L)
+    # PIL allocates a mask the size of the polygon's bounding box, so a triangle that
+    # projects far outside the canvas (a vertex right in front of the camera, where
+    # cx/cz explodes, or a stretched test pose) makes it ask for gigabytes and crash the
+    # process with a native access violation. Clamp and drop the ones that cannot show.
+    mx = my = 8.0
     for t in order:
         v = fvi[t]
         if (cz[v] < 0.05).any():
             continue                                  # behind the camera
-        poly = [(float(sx[v[0]]), float(sy[v[0]])), (float(sx[v[1]]), float(sy[v[1]])),
-                (float(sx[v[2]]), float(sy[v[2]]))]
+        px = np.clip(sx[v], -mx, W + mx)
+        py = np.clip(sy[v], -my, H + my)
+        if not (np.isfinite(px).all() and np.isfinite(py).all()):
+            continue
+        if px.max() <= 0.0 or px.min() >= W or py.max() <= 0.0 or py.min() >= H:
+            continue                                  # entirely off screen
+        poly = [(float(px[0]), float(py[0])), (float(px[1]), float(py[1])),
+                (float(px[2]), float(py[2]))]
         uv = st[t].mean(0)
         im = tex[face_mat[t]]
         th, tw = im.shape[:2]

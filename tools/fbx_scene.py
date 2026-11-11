@@ -189,6 +189,36 @@ class Scene:
         self.bind_dup_err = max(dup.values()) if dup else 0.0
         return out
 
+    def bind_pose_clusters(self):
+        """name -> 4x4 bind world matrix, read from the skin clusters' TransformLink.
+
+        The Pose nodes are the primary source, but some Mixamo exports scramble them
+        (every limb collapsed onto one line, feet above the hips).  TransformLink is the
+        same bind pose the skinning itself uses, so it is the reliable fallback.
+
+        returns (dict, max deviation between clusters that share a bone)
+        """
+        out, dup = {}, {}
+        for d in self.by.get("Deformer", []):
+            if len(d.props) < 3 or d.props[2] != "Cluster":
+                continue
+            m = d.child("TransformLink")
+            if m is None:
+                continue
+            bone = None
+            for ch in self.children_of.get(d.props[0], []):
+                node = self.uid2model.get(ch)
+                if node is not None and node.props[2] in ("LimbNode", "Limb"):
+                    bone = clean_name(node.props[1])
+            if bone is None:
+                continue
+            M = np.array(m.props[0], float).reshape(4, 4)
+            if bone in out:
+                dup[bone] = max(dup.get(bone, 0.0), float(np.abs(M - out[bone]).max()))
+            else:
+                out[bone] = M
+        return out, (max(dup.values()) if dup else 0.0)
+
     def geometry_of(self):
         """[(geometry_node, mesh_model_uid, mesh_model_name)]"""
         out = []

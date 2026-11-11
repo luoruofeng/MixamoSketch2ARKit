@@ -37,6 +37,34 @@ def gf(m):
     return Gf.Matrix4d([[float(m[r][c]) for c in range(4)] for r in range(4)])
 
 
+def skel_layout_problems(stage):
+    """What usdSkelValidators.SkelBindingAPIValidator / RealityKit look for.
+
+    A prim that carries SkelBindingAPI has to be a SkelRoot or to sit underneath one.
+    Getting this wrong does not break the file structurally - usdchecker only warns -
+    but RealityKit then finds no deformable binding for the mesh and renders the bind
+    pose (a frozen T-pose) instead of the tracked pose.
+    """
+    problems = []
+    dp = stage.GetDefaultPrim()
+    if not dp:
+        problems.append("no defaultPrim")
+    elif dp.GetTypeName() != "SkelRoot":
+        problems.append("defaultPrim %s is %s, expected SkelRoot"
+                        % (dp.GetPath(), dp.GetTypeName()))
+
+    for prim in stage.Traverse():
+        if not prim.HasAPI(UsdSkel.BindingAPI) or prim.IsA(UsdSkel.Root):
+            continue
+        anc = prim.GetParent()
+        while anc and not anc.IsA(UsdSkel.Root):
+            anc = anc.GetParent()
+        if not anc:
+            problems.append("%s has SkelBindingAPI but is not rooted at a SkelRoot"
+                            % prim.GetPath())
+    return problems
+
+
 def build(slug):
     bdir = config.build_dir(slug)
     for needed in ("mesh_meta.json", "mesh.npz"):
@@ -88,7 +116,11 @@ def build(slug):
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
 
     # Apple's biped_robot.usdz uses SkelRoot + kind=component as the default prim; the
-    # loader looks for a SkelRoot to find the skeleton, so mirror that layout.
+    # loader looks for a SkelRoot to find the skeleton, so mirror that layout. Both the
+    # skeleton *and* the skinned mesh have to end up underneath this prim: a mesh whose
+    # ancestors do not include a SkelRoot is rejected by usdchecker
+    # (usdSkelValidators:SkelBindingAPIValidator.InvalidSkelBindingAPIApply) and gets no
+    # deformable binding in RealityKit (it only draws the bind pose).
     root = UsdSkel.Root.Define(stage, "/" + slug).GetPrim()
     stage.SetDefaultPrim(root)
     Usd.ModelAPI(root).SetKind(Kind.Tokens.component)
@@ -221,8 +253,19 @@ def build(slug):
         sub.CreateElementTypeAttr().Set(UsdGeom.Tokens.face)
         sub.CreateIndicesAttr().Set(Vt.IntArray.FromNumpy(faces.astype(np.int32)))
         sub.GetPrim().SetDisplayName(info["name"])
-        UsdShade.MaterialBindingAPI(sub.GetPrim()).Bind(make_material(info, nm))
+        # .Apply() (not MaterialBindingAPI(prim)) is what puts MaterialBindingAPI into the
+        # subset's apiSchemas; authoring material:binding without it is what usdchecker
+        # reports as "MaterialBindingAPI not applied on GeomSubset"
+        UsdShade.MaterialBindingAPI.Apply(sub.GetPrim()).Bind(make_material(info, nm))
         subset_of_mat[nm] = mi
+
+    if subset_of_mat:
+        # the materialBind family has to be declared as a partition of the mesh, otherwise
+        # its familyType defaults to "unrestricted" (usdchecker / Apple both want
+        # "partition"); SetFamilyType authors "subsetFamily:materialBind:familyType" on
+        # the mesh, exactly like Apple's biped_robot.usdz does
+        UsdGeom.Subset.SetFamilyType(UsdGeom.Imageable(mesh), "materialBind",
+                                     UsdGeom.Tokens.partition)
 
     covered = np.zeros(len(tris), bool)
     for mi in subset_of_mat.values():
@@ -236,6 +279,11 @@ def build(slug):
                    "doubleSided": bool(mesh.GetDoubleSidedAttr().Get())}, fh, indent=1)
 
     usdc = config.usdc_path(slug)
+    # fail before writing anything if the stage is not the layout RealityKit needs
+    problems = skel_layout_problems(stage)
+    if problems:
+        raise SystemExit("%s: stage is not ARKit-loadable (SkelRoot layout):\n  - %s"
+                         % (slug, "\n  - ".join(problems)))
     stage.GetRootLayer().Export(usdc)
     out_usdz = config.usdz_path(slug)
     os.makedirs(os.path.dirname(out_usdz), exist_ok=True)
@@ -249,6 +297,17 @@ def build(slug):
     size = os.path.getsize(out_usdz) if os.path.exists(out_usdz) else 0
     print("wrote", usdc)
     print("usdz package:", ok, out_usdz, "%.1f MB" % (size / 1e6))
+
+    # the packaged file is what the app actually loads, so check the layout survived
+    # packaging too (a stale/hand-edited usdz in dist/ is what silently kept a T-pose)
+    if ok and size > 0:
+        problems = skel_layout_problems(Usd.Stage.Open(out_usdz))
+        if problems:
+            print("ERROR: packaged usdz is not ARKit-loadable:")
+            for p in problems:
+                print("  -", p)
+            return False
+        print("layout: defaultPrim SkelRoot + every SkelBindingAPI prim underneath it")
     return ok and size > 0
 
 
