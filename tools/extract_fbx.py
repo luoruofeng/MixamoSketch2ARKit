@@ -7,9 +7,14 @@ usage:  python tools/extract_fbx.py <ModelSlug> [...]   (slug = fbx basename, sp
 Output (build/<slug>/): mesh.npz, mesh_meta.json, tex/*
 Everything is written in ARKit / USD space: metres, +Y up, +Z forward, left side on +X.
 
-The joint table is produced by arkit_fit.build_target: every joint takes Apple's bone
+The joint table is produced by arkit_fit.build_target: every body joint takes Apple's bone
 DIRECTION and the character's own segment LENGTH, and the mesh is deformed with the same
 rotations so the character is straightened into a clean T-pose (bones stay in the flesh).
+Two chains are the exception: the hand keeps the character's own finger directions (so the
+whole hand is carried rigidly by the wrist and is never reshaped), and the leg chain keeps
+the character's own stance - only its sideways splay is straightened - so the sole stays
+flat on the ground and the knee keeps the character's own bend instead of the reference
+robot's 15 degree one (see arkit_fit.DEFAULT_SAGITTAL).
 """
 import argparse
 import sys, os, json, hashlib, re, io
@@ -364,11 +369,22 @@ def extract(slug):
         raise SystemExit("FATAL: bones missing from bind pose: %s" % name)
 
     def tip_from_mesh(group_bone, base, direction, pct=99.5):
-        """furthest mesh vertex of a bone group along `direction` (character-specific tip)"""
+        """furthest mesh vertex of a bone group along `direction` (character-specific tip)
+
+        EVERY geometry that carries the group is measured and the one that reaches
+        furthest wins.  The first match is not good enough: a skin / trousers cluster can
+        sit entirely BEHIND the bone (this project had a toe whose body and pants clusters
+        landed 8 cm behind ToeBase while the shoe - the thing whose tip the joint has to
+        reach - was in front of it), which put toesEnd_joint behind the ball of the foot
+        and made the toe bone point backwards.  That used to be hidden by snapping the toe
+        direction onto Apple's reference; now that the toe keeps the character's own
+        direction it has to be right.
+        """
         d = np.linalg.norm(direction)
         if d < 1e-9:
             return None
         direction = direction / d
+        best = None
         for (_, _, v0, count, wts) in geo_info:
             d_ = wts.get(group_bone)
             if not d_:
@@ -377,9 +393,10 @@ def extract(slug):
             if len(idx) < 4:
                 continue
             P = PTS[v0 + np.array(idx)]
-            s = (P - base) @ direction
-            return base + direction * float(np.percentile(s, pct))
-        return None
+            s = float(np.percentile((P - base) @ direction, pct))
+            if s > 0.0 and (best is None or s > best):
+                best = s
+        return None if best is None else base + direction * best
 
     # -------------------------------------------------------------- joint fit
     char = {k: cget(k) for k in ("Hips", "Spine", "Spine1", "Spine2", "Neck", "Head")}
@@ -389,6 +406,11 @@ def extract(slug):
         for an, mix in FINGERS:
             for i in (1, 2, 3):
                 char[P + mix + str(i)] = cget(P + mix + str(i))
+    # the eyeballs are the only face geometry a Mixamo rig skins; keep their joint on the
+    # character's own eye so those vertices do not have to be moved into place
+    for key in ("LeftEye", "RightEye"):
+        if key in CP:
+            char[key] = CP[key].copy()
 
     # ARKit drives joints by NAME, so a character baked facing -Z (or with its left
     # side on -X) has to be rotated before anything is measured from it.
@@ -397,29 +419,61 @@ def extract(slug):
         warnings.append(note)
         print("NOTE:", note)
 
+    done = {}          # (side, finger) -> tip, so a missing side can borrow the other one
     for side, P in SIDE.items():
+        other = "right" if side == "left" else "left"
         for an, mix in FINGERS:
             base = char[P + mix + "3"]
             prev = char[P + mix + "2"]
             tip = tip_from_mesh(P + mix + "3", base, base - prev)
             if tip is None:
-                tip = base + (base - prev) * 0.35
-                warnings.append("%s %s tip extrapolated (no mesh)" % (side, an))
+                # no skin cluster on this side (see the mirroring repair below): the other
+                # hand is the same shape mirrored, which beats guessing a length
+                mirror = done.get((other, an))
+                if mirror is not None:
+                    tip = np.array([-mirror[0], mirror[1], mirror[2]])
+                    warnings.append("%s %s tip mirrored from the other hand" % (side, an))
+                else:
+                    tip = base + (base - prev) * 0.35
+                    warnings.append("%s %s tip extrapolated (no mesh)" % (side, an))
             char[side + "_tip_" + an] = tip
+            done[(side, an)] = tip
         base = char[P + "ToeBase"]
         d = base - char[P + "Foot"]
         d = np.array([d[0], 0.0, d[2]])
         tip = tip_from_mesh(P + "ToeBase", base, d)
         if tip is None:
-            tip = base + d * 0.5
-            warnings.append("%s toe tip extrapolated (no mesh)" % side)
+            mirror = done.get((other, "Toe"))
+            if mirror is not None:
+                tip = np.array([-mirror[0], mirror[1], mirror[2]])
+                warnings.append("%s toe tip mirrored from the other foot" % side)
+            else:
+                tip = base + d * 0.5
+                warnings.append("%s toe tip extrapolated (no mesh)" % side)
         char[side + "_tip_Toe"] = tip
+        done[(side, "Toe")] = tip
 
     height = float(PTS[:, 1].max() - PTS[:, 1].min())
     pos, D = fit.build_target(char, ref, height_scale=height / ref.height)
     missing = [j for j in ARKIT if j not in pos]
     assert not missing, missing
     print("joints placed: %d (reference directions, character segment lengths)" % len(pos))
+
+    # ---- leg stance: the knee bend and the foot pitch are the character's own (Apple's
+    # robot stands with a bent knee and a shallower ankle->ball line - aiming the leg at
+    # it tilts the whole foot up and walks around with bent knees on every frame).
+    stance = fit.stance_report(char, pos)
+    for side in ("left", "right"):
+        st = stance.get(side)
+        if not st:
+            continue
+        print("stance %-5s knee bend %5.1f deg (own %5.1f) | foot pitch %+6.2f deg (own %+6.2f)"
+              % (side, st["knee_bend"], st["knee_bend_own"],
+                 st["foot_pitch"], st["foot_pitch_own"]))
+        tilt = st["foot_pitch"] - st["foot_pitch_own"]
+        if abs(tilt) > 2.0:
+            warnings.append("%s foot is pitched %.1f deg away from the character's own "
+                            "stance - the sole leaves the ground" % (side, tilt))
 
     # -------------------------------------------------------------- weight remap
     WMAP = fit.weight_joint_map()
@@ -434,6 +488,20 @@ def extract(slug):
             vi = np.fromiter(d.keys(), np.int64, len(d))
             WB[v0 + vi, BIDX[bone]] = np.fromiter(d.values(), np.float32, len(d))
     WB /= np.maximum(WB.sum(1, keepdims=True), 1e-8)
+
+    # A skin cluster only exists for bones the exporter actually weighted, and some Mixamo
+    # exports are missing a whole bone on one side (this project saw a right middle finger
+    # with no clusters at all: those joints ended up with zero weight and the finger never
+    # moved).  Add the empty mirrored column so the mirror pass below can fill it in.
+    absent = [fit.mirror_name(b) for b in bone_names
+              if b.startswith("Left") and fit.mirror_name(b) not in BIDX]
+    if absent:
+        WB = np.hstack([WB, np.zeros((nv, len(absent)), np.float32)])
+        for b in absent:
+            BIDX[b] = len(bone_names)
+            bone_names.append(b)
+        warnings.append("skin is missing %s; mirrored from the other side"
+                        % ", ".join(sorted(absent)))
 
     # UV / material seams are duplicated vertices: if their weights differ the mesh
     # tears open the moment the rest pose changes.  Give every coincident vertex group
@@ -467,6 +535,10 @@ def extract(slug):
     if SYM_WEIGHTS:
         WB, nmoved = fit.mirror_weights(PTS, WB, bone_names)
         print("symmetric weights: %d right-side vertices took the mirrored left weights" % nmoved)
+        if absent:
+            WB, nfill = fit.mirror_fill(PTS, WB, bone_names, absent)
+            WB /= np.maximum(WB.sum(1, keepdims=True), 1e-8)
+            print("missing-side bones filled: %d vertices (%s)" % (nfill, ", ".join(absent)))
 
     # ---- straighten the character into the reference T-pose (bones stay in the flesh)
     TF = fit.bone_transforms(char, pos, D, WMAP)
@@ -482,8 +554,11 @@ def extract(slug):
     TN = np.einsum("nkij,nkj->nki", Rv[TRIS], TN)
     TN /= np.maximum(np.linalg.norm(TN, axis=2, keepdims=True), 1e-8)
     disp = np.linalg.norm(PTS - PTS0, axis=1)
-    e0 = np.linalg.norm(PTS0[TRIS[:, 0]] - PTS0[TRIS[:, 1]], axis=1)
-    e1 = np.linalg.norm(PTS[TRIS[:, 0]] - PTS[TRIS[:, 1]], axis=1)
+    # all three half-edges of every triangle: sampling only v0-v1 (as this used to)
+    # underestimates the worst stretch of a triangle by up to 2x
+    E = np.concatenate([TRIS[:, [0, 1]], TRIS[:, [1, 2]], TRIS[:, [2, 0]]])
+    e0 = np.linalg.norm(PTS0[E[:, 0]] - PTS0[E[:, 1]], axis=1)
+    e1 = np.linalg.norm(PTS[E[:, 0]] - PTS[E[:, 1]], axis=1)
     vis = e0 > 0.002                      # sub-2 mm slivers are seam stitches
     ratio = e1 / np.maximum(e0, 1e-6)
     print("T-pose re-fit: max vertex move %.1f mm, mean %.1f mm" % (disp.max() * 1000, disp.mean() * 1000))
@@ -517,16 +592,19 @@ def extract(slug):
     KW = fit.torso_kernel(PTS, pos)
     DENSE[:, torso] = KW * torso_total[:, None]
 
-    # ---- P0-1: hand the distal finger phalanx to _3 (was: _3 and End both at 0).
-    # The thumb has no _3 in ARKit's skeleton (Start/_1/_2/End), so it is skipped.
+    # ---- Apple's metacarpal (hand*Start) has no Mixamo bone: give it the distal palm,
+    # otherwise those four joints stay at exactly zero weight and the palm never follows
+    # the metacarpals.  (The old code instead moved _2's weight onto _3, a hack that was
+    # only needed because the finger chain was mapped one joint too proximal.)
     for side in ("left", "right"):
-        for an, _ in FINGERS[:4]:
-            j2 = JIDX[side + "_hand%s_2_joint" % an]
-            j3 = JIDX[side + "_hand%s_3_joint" % an]
-            w2 = DENSE[:, j2].copy()
-            move = w2 * fit.tip_ramp(PTS, pos, ARKIT[j2], ARKIT[j3])
-            DENSE[:, j2] -= move
-            DENSE[:, j3] += move
+        jh = JIDX[side + "_hand_joint"]
+        share = fit.palm_starts(PTS, pos, side)
+        src = DENSE[:, jh].copy()
+        for k, (an, _) in enumerate(fit.FINGERS):
+            j = JIDX[side + "_hand%sStart_joint" % an]
+            move = src * share[:, k]
+            DENSE[:, jh] -= move
+            DENSE[:, j] += move
 
     jidx, jw, empty = fit.top_influences(DENSE, 4)
     if empty.any():
@@ -542,6 +620,21 @@ def extract(slug):
     print("re-fit moved most: " + ", ".join("%s %.0fmm" % (k, v) for k, v in
                                             sorted(worst.items(), key=lambda kv: -kv[1])[:5]))
 
+    # the hand is the part Apple's reference is least like a human (its fingers are a
+    # robot paddle), so report its distortion on its own: with the finger joints on the
+    # character's own hand nothing in there may be reshaped any more (it is carried
+    # rigidly by the wrist, so the ratio has to stay at 1.00)
+    HAND_J = [i for i, j in enumerate(ARKIT) if "_hand" in j]
+    he = vis & np.isin(dom[E[:, 0]], HAND_J) & np.isin(dom[E[:, 1]], HAND_J)
+    if he.any():
+        k = int(np.argmax(ratio * he))
+        print("hand-region edge stretch: max x%.2f (%.1f mm -> %.1f mm), %d edges"
+              % (float(ratio[k]), e0[k] * 1000, e1[k] * 1000, int(he.sum())))
+        if float(ratio[k]) > 1.6:
+            warnings.append("hand mesh is distorted (edge stretch x%.2f) - the finger "
+                            "joints are not following the character's own hand"
+                            % float(ratio[k]))
+
     present = np.zeros(len(ARKIT), bool)
     present[jidx[jw > 0]] = True
     wcount = present.astype(np.int32)
@@ -549,12 +642,32 @@ def extract(slug):
           (int(present.sum()), len(ARKIT), int((jw > 0).sum(1).max())))
 
     # -------------------------------------------------------------- alignment report
+    # The hand, the face and the leg stance are deliberately NOT snapped to the reference:
+    # Apple's hand is a robot paddle (its finger directions point 10-40 deg away from a
+    # human's), the eye offset follows the character's own eyeballs, and the leg chain keeps
+    # the character's own stance (see fit.DEFAULT_SAGITTAL - the robot's bent knees and
+    # shallower foot).  Those rows are reported separately instead of being flagged as
+    # misaligned.
     rows = fit.compare(pos, ref, height_scale=height / ref.height)
-    dmax = max(rows, key=lambda r: r[1])
-    pmax = max(rows, key=lambda r: r[2])
+    stance_j = set(s + j for s in ("left", "right")
+                   for j in ("_leg_joint", "_foot_joint", "_toes_joint", "_toesEnd_joint"))
+    snapped = [r for r in rows if "_hand" not in r[0] and "eye" not in r[0]
+               and r[0] not in stance_j]
+    hand_rows = [r for r in rows if "_hand" in r[0]]
+    leg_rows = [r for r in rows if r[0] in stance_j]
+    dmax = max(snapped, key=lambda r: r[1])
+    pmax = max(snapped, key=lambda r: r[2])
+    hmax = max(hand_rows, key=lambda r: r[1]) if hand_rows else None
+    lmax = max(leg_rows, key=lambda r: r[1]) if leg_rows else None
     print("alignment: max bone-direction deviation %.2f deg (%s), max position deviation %.1f mm (%s)"
           % (dmax[1], dmax[0], pmax[2], pmax[0]))
-    bad_dir = [r for r in rows if r[1] > 4.0]
+    if hmax is not None:
+        print("           hand keeps the character's own finger spread (up to %.1f deg off "
+              "the reference's paddle hand)" % hmax[1])
+    if lmax is not None:
+        print("           leg keeps the character's own stance (up to %.1f deg off the "
+              "reference's bent-knee robot, see 'stance' above)" % lmax[1])
+    bad_dir = [r for r in snapped if r[1] > 4.0]
     if bad_dir:
         warnings.append("bone directions still off: %s" %
                         ", ".join("%s %.1f deg" % (r[0], r[1]) for r in bad_dir[:6]))
@@ -582,7 +695,14 @@ def extract(slug):
                     "ref_height": round(ref.height, 4), "char_height": round(height, 4),
                     "tp_pose_max_move_mm": round(float(disp.max() * 1000), 1),
                     "weighted_joints": int((DENSE > 1e-6).any(0).sum()),
-                    "zero_weight_joints": [j for i, j in enumerate(ARKIT) if wcount[i] == 0]}}
+                    "zero_weight_joints": [j for i, j in enumerate(ARKIT) if wcount[i] == 0],
+                    # own vs fitted leg stance; validate_usdz.py re-checks the shipped
+                    # file against these numbers (sole level, no extra knee bend)
+                    "stance": {k: {n: round(v, 2) for n, v in st.items()}
+                               for k, st in stance.items()},
+                    # which chains kept the character's own stance (validate_usdz only
+                    # enforces the two checks below for the chains that were not snapped)
+                    "stance_sagittal": fit.sagittal_flags()}}
     with open(os.path.join(out, "mesh_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1)
 

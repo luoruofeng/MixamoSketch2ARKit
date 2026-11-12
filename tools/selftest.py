@@ -42,13 +42,14 @@ def mixamo_char(ref):
             char[S + mix] = p["%s_%s_joint" % (side, arkit)]
         for an, mix in fit.FINGERS_ALL:
             pre = "hand" + an
-            src = ["%s_%sStart_joint" % (side, pre), "%s_%s_1_joint" % (side, pre),
-                   "%s_%s_2_joint" % (side, pre)]
+            # Mixamo's 1..3 are the phalanges, i.e. Apple's _1/_2/_3; only the thumb has a
+            # metacarpal bone (its 1 is Apple's Start).  The mesh tip is End.
+            src = (["%s_%sStart_joint" % (side, pre), "%s_%s_1_joint" % (side, pre),
+                    "%s_%s_2_joint" % (side, pre)] if an == "Thumb" else
+                   ["%s_%s_%d_joint" % (side, pre, k) for k in (1, 2, 3)])
             for i, j in enumerate(src, 1):
                 char[S + mix + str(i)] = p[j]
-            tip = (side + "_handThumb_2_joint" if an == "Thumb"
-                   else side + "_hand%s_3_joint" % an)
-            char[side + "_tip_" + an] = p[tip]
+            char[side + "_tip_" + an] = p["%s_%sEnd_joint" % (side, pre)]
         char[side + "_tip_Toe"] = p[side + "_toesEnd_joint"]
     return char
 

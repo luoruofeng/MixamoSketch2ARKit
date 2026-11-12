@@ -2,7 +2,11 @@
 checklist, prove the skinning actually works (LBS test), and verify the things that
 went wrong before:
 
-  * every bone direction matches Apple's reference (was 6-20 deg off)
+  * every bone direction matches Apple's reference (was 6-20 deg off), except the two
+    chains that deliberately keep the character's own shape: the hand (a robot paddle,
+    not a hand) and the leg stance (a robot with bent knees and a shallower foot)
+  * the foot stays level: the character's own ankle -> ball pitch and knee bend survive
+    the fit, so the sole is not tilted off the ground (was 3-15 deg toes-up)
   * every joint that carries skinning has weight (was 39 joints at zero)
   * finger _3 / End have a real length (was 0 mm, tip verts all on _2)
   * spine / neck weights are continuous (was spine_1/3/5/7 and neck_1/3/4 at zero)
@@ -13,6 +17,7 @@ usage:
     python tools/validate_usdz.py dist/Foo_ARKit.usdz  # one file
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -181,21 +186,99 @@ def validate(usdz, skel_json=None):
     print("== reference alignment (the point of the whole exercise) ==")
     ref = fit.Ref(skel_json or config.SKEL_JSON)
     rows = fit.compare({n: bpos(n) for n in names}, ref, height_scale=height / ref.height)
-    ddir = max(rows, key=lambda r: r[1])
-    # leaf joints (finger tips) and unweighted face joints accumulate the length error of
-    # a whole chain, so only body joints say something about the retarget quality
-    body = [r for r in rows if not (r[0].endswith("End_joint")
-                                    or r[0] in ("jaw_joint", "chin_joint", "nose_joint")
-                                    or "eye" in r[0])]
-    dpos = max(body, key=lambda r: r[2])
-    check(ddir[1] < 3.0, "every bone direction follows Apple's reference: worst %s %.2f deg"
+    # The hand is deliberately NOT snapped to the reference: Apple's reference hand is a
+    # robot paddle whose finger directions point 10-40 deg away from a human hand's, and
+    # forcing a character's fingers onto them tore the hand apart.  The eye offset follows
+    # the character's own eyeballs.
+    # The leg chain is deliberately not snapped either (arkit_fit.DEFAULT_SAGITTAL): only
+    # its sideways splay follows the reference, the pitch is the character's own, because
+    # the robot stands with a 15 deg knee bend and an ankle->ball line 12 deg shallower
+    # than a human foot's.  Forcing those onto a human lifted the whole foot off the
+    # ground and added a permanent bent knee.  Its own check is below.
+    legs = set(n for s in ("left", "right")
+               for n in (s + "_leg_joint", s + "_foot_joint", s + "_toes_joint",
+                         s + "_toesEnd_joint"))
+    body = [r for r in rows if "_hand" not in r[0] and "eye" not in r[0] and r[0] not in legs]
+    leg_rows = [r for r in rows if r[0] in legs]
+    ddir = max(body, key=lambda r: r[1])
+    # leaf joints (finger tips) accumulate the length error of a whole chain, so only
+    # joints that carry a real segment say something about the retarget quality
+    inner = [r for r in body if not (r[0].endswith("End_joint")
+                                     or r[0] in ("jaw_joint", "chin_joint", "nose_joint"))]
+    dpos = max(inner, key=lambda r: r[2])
+    check(ddir[1] < 3.0, "every body bone direction follows Apple's reference: worst %s %.2f deg"
           % (ddir[0], ddir[1]))
+    hand = [r for r in rows if "_hand" in r[0]]
+    if hand:
+        hdir = max(hand, key=lambda r: r[1])
+        print("      hand keeps the character's own finger spread: worst %s %.1f deg off "
+              "the reference's paddle hand (expected, not an error)" % (hdir[0], hdir[1]))
+    if leg_rows:
+        ldir = max(leg_rows, key=lambda r: r[1])
+        print("      leg keeps the character's own stance: worst %s %.1f deg off the "
+              "reference's bent-knee robot (expected, checked below)" % (ldir[0], ldir[1]))
     print("      largest body-joint position deviation vs the reference scaled to %.3f m: "
           "%s %.1f mm" % (height, dpos[0], dpos[2]))
     print("      (residual = segment LENGTH differences; the reference is a robot with much"
           " longer legs / neck / fingers)")
     warn(dpos[2] < 60.0, "body-joint position deviation < 60 mm (worst %.1f mm @%s)"
          % (dpos[2], dpos[0]))
+
+    # ---- the foot has to stay level: no fit = no change of the character's own stance
+    print("== foot stance (the mesh must keep the character's own, not Apple's robot) ==")
+    slug = os.path.basename(usdz)
+    slug = slug[:-len("_ARKit.usdz")] if slug.endswith("_ARKit.usdz") else slug[:-5]
+    stance_meta, fit_meta = {}, {}
+    meta_path = os.path.join(config.build_dir(slug), "mesh_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as fh:
+            fit_meta = json.load(fh).get("fit", {})
+        stance_meta = fit_meta.get("stance", {})
+    # only chains that were actually fitted with the character's own stance can be held to
+    # it; a run with DEFAULT_SAGITTAL overridden to False is a deliberate choice
+    flags = fit_meta.get("stance_sagittal", fit.DEFAULT_SAGITTAL)
+
+    def pitch(v):
+        return math.degrees(math.asin(float(np.clip(v[1] / max(np.linalg.norm(v), 1e-9),
+                                                  -1.0, 1.0))))
+
+    def _report(chain, cond, msg):
+        """stance check that only binds for a chain fitted with the character's own
+        stance; a chain deliberately snapped to the reference is just reported"""
+        if flags.get(chain, True):
+            check(cond, msg)
+        else:
+            print("      (%s snapped to the reference on purpose) %s" % (chain, msg))
+
+    for s in ("left", "right"):
+        ankle, ball = bpos(s + "_foot_joint"), bpos(s + "_toes_joint")
+        knee = bpos(s + "_leg_joint")
+        foot_pitch = pitch(ball - ankle)
+        # a planted foot puts the ball of the foot below the ankle (Apple's robot -22.9,
+        # every Mixamo character -26..-38); a flat foot whose ball sits higher means the
+        # whole foot was pitched up by the fit
+        check(-50.0 < foot_pitch < -8.0,
+              "%s foot pitch (ankle -> ball) %+.1f deg - the ball sits below the ankle"
+              % (s, foot_pitch))
+        own = stance_meta.get(s, {})
+        if own:
+            d = foot_pitch - own.get("foot_pitch_own", foot_pitch)
+            msg = ("%s foot keeps the character's own pitch (%+.2f vs %+.2f deg, "
+                   "%+.2f off -> sole stays on the ground)"
+                   % (s, foot_pitch, own.get("foot_pitch_own", 0.0), d))
+            _report("foot", abs(d) < 1.5, msg)
+            knee_now = 180.0 - math.degrees(math.acos(float(np.clip(
+                fit.unit(knee - bpos(s + "_upLeg_joint"))
+                @ fit.unit(ankle - knee), -1.0, 1.0))))
+            dk = knee_now - own.get("knee_bend_own", knee_now)
+            # straightening the sideways splay can only make the knee a hair straighter;
+            # what must never happen is the reference's extra 8-15 deg of bend
+            _report("leg", -3.0 < dk < 6.0,
+                    "%s knee keeps the character's own bend (%.1f vs %.1f deg, %+.1f off)"
+                    % (s, knee_now, own.get("knee_bend_own", 0.0), dk))
+        else:
+            print("      (no %s - only the plausible-foot check above)" % meta_path)
+
 
     emax, worst = 0.0, None
     rb = {n: np.array(m) for n, m in zip(ref.joints, ref.bind_world)}
@@ -221,11 +304,60 @@ def validate(usdz, skel_json=None):
             j = "%s_%s_3_joint" % (s, pre)
             if j in idx:
                 tips[j] = float(np.linalg.norm(bpos("%s_%sEnd_joint" % (s, pre)) - bpos(j)) * 1000)
-    bad_tip = {k: v for k, v in tips.items() if not (8.0 <= v <= 30.0)}
-    check(not bad_tip, "finger _3 -> End tip length 8..30 mm (Apple: 18-20 mm) -> %s"
-          % ", ".join("%s %.1f mm" % (k, v) for k, v in sorted(tips.items())[:4]))
+    # `_3 -> End` is the character's own distal phalanx (see build_target), so it is
+    # checked against the middle phalanx instead of an absolute length: Apple's reference
+    # ratio is 26 mm / 26 mm = 1.0, a human's tip is a bit shorter than the DIP segment.
+    mids = {k: float(np.linalg.norm(bpos(k) - bpos(k.replace("_3_joint", "_2_joint")))) * 1000
+            for k in tips}
+    bad_tip = {k: (v, mids[k]) for k, v in tips.items()
+               if v < 2.0 or not (0.4 <= v / max(mids[k], 1e-6) <= 2.2)}
+    check(not bad_tip, "finger _3 -> End is a real distal phalanx (0.4-2.2 x the middle "
+                       "phalanx, Apple 1.0) -> %s"
+          % ", ".join("%s %.1f mm (mid %.1f)" % (k, v, mids[k])
+                      for k, v in sorted(tips.items())[:4]))
     if bad_tip:
-        print("     out of range:", {k: round(v, 1) for k, v in bad_tip.items()})
+        print("     out of range:", {k: "%.1f mm vs mid %.1f mm" % v
+                                     for k, v in bad_tip.items()})
+
+    # Apple's finger is  metacarpal(Start->_1) > proximal > middle > distal : the
+    # metacarpal is the longest bone of the chain and the joint that carries it sits
+    # inside the palm.  Mapping Mixamo's phalanges onto Start.._2 (one joint too
+    # proximal) makes the proximal and middle phalanx swap roles, which this catches.
+    flat = []
+    for s in ("left", "right"):
+        for an, pre in FINGERS:
+            k = "%s_%s" % (s, pre)
+            if k + "_3_joint" not in idx:
+                continue
+            meta = np.linalg.norm(bpos(k + "Start_joint") - bpos(k + "_1_joint"))
+            prox = np.linalg.norm(bpos(k + "_1_joint") - bpos(k + "_2_joint"))
+            mid = np.linalg.norm(bpos(k + "_2_joint") - bpos(k + "_3_joint"))
+            if meta <= prox or meta <= mid:
+                flat.append("%s (%.0f / %.0f / %.0f mm)"
+                            % (k, meta * 1000, prox * 1000, mid * 1000))
+    check(not flat, "finger chain has Apple's proportions: metacarpal (Start->_1) is the "
+                    "longest segment" + ("" if not flat else " -> %s" % flat))
+
+    # ...and the joints run in order from inside the palm to the tip.  Measured on
+    # Apple's reference: Start 0.12, _1 0.51, _2 0.74, _3 0.87, End 1.00 of the
+    # wrist -> tip distance.  Anything that puts a whole phalanx on the wrong joint
+    # (Start at the knuckle) shows up here as t(Start) > 0.35.
+    out_of_order = []
+    for s in ("left", "right"):
+        for an, pre in FINGERS:
+            chain = [s + "_" + pre + k for k in
+                     ("Start_joint", "_1_joint", "_2_joint", "_3_joint", "End_joint")]
+            if any(j not in idx for j in chain):
+                continue
+            hand = bpos(s + "_hand_joint")
+            axis = bpos(chain[-1]) - hand
+            L2 = max(float(axis @ axis), 1e-9)
+            t = [float((bpos(j) - hand) @ axis / L2) for j in chain]
+            if t[0] > 0.35 or not all(b > a + 0.01 for a, b in zip(t, t[1:])):
+                out_of_order.append("%s %s (%s)" % (s, pre, np.round(t, 2)))
+    check(not out_of_order, "finger joints run metacarpal -> tip in order, Start inside "
+                            "the palm (Apple: 0.12/0.51/0.74/0.87/1.00)"
+          + ("" if not out_of_order else " -> %s" % out_of_order))
 
     print("== T-pose sanity ==")
     larm, lfa, lhand = bpos("left_arm_joint"), bpos("left_forearm_joint"), bpos("left_hand_joint")
@@ -283,10 +415,15 @@ def validate(usdz, skel_json=None):
           + ("" if not borrowed else " -> %s" % borrowed))
 
     print("== spine / neck weight continuity (was: 11 of 12 at zero) ==")
+    # 200 vertices on a ~20 k-vertex character; scaled with the mesh so a low-poly
+    # character is not failed for having few vertices (each joint still has to own a
+    # real band of flesh, no joint may be left at zero)
+    need = max(25, int(0.008 * tot_v))
     for j in (["spine_%d_joint" % k for k in range(1, 8)]
               + ["neck_%d_joint" % k for k in range(1, 5)]):
-        check(int(cov[idx[j]]) > 200,
-              "%-14s %6d verts, total weight %8.1f" % (j, int(cov[idx[j]]), wsum[idx[j]]))
+        check(int(cov[idx[j]]) > need,
+              "%-14s %6d verts (> %d), total weight %8.1f"
+              % (j, int(cov[idx[j]]), need, wsum[idx[j]]))
 
     print("== left / right symmetry ==")
     for a in ("arm", "forearm", "shoulder_1", "upLeg", "leg", "foot"):
